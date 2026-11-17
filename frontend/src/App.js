@@ -23,6 +23,7 @@ export default function App() {
   const [micState,   setMicState]   = useState(MIC_IDLE);
   const [typedQ,     setTypedQ]     = useState("");      // text input fallback
   const [error,      setError]      = useState("");
+  const [demos,      setDemos]      = useState([]);      // cached demo videos
 
   // ── Refs ───────────────────────────────────────────────────────────────────
   const mediaRecorder = useRef(null);
@@ -35,10 +36,28 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // ── Load video ─────────────────────────────────────────────────────────────
-  async function handleLoadVideo(e) {
+  // ── Demo videos (transcripts cached on the server, always load) ──────────
+  useEffect(() => {
+    fetch(`${API}/demos`)
+      .then(r => (r.ok ? r.json() : { demos: [] }))
+      .then(d => setDemos(d.demos || []))
+      .catch(() => setDemos([]));
+  }, []);
+
+  function handleLoadVideo(e) {
     e.preventDefault();
-    if (!url.trim()) return;
+    loadVideo(url);
+  }
+
+  function loadDemo(videoId) {
+    const demoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    setUrl(demoUrl);
+    loadVideo(demoUrl);
+  }
+
+  // ── Load video ─────────────────────────────────────────────────────────────
+  async function loadVideo(targetUrl) {
+    if (!targetUrl.trim()) return;
     setLoading(true);
     setError("");
     setMessages([]);
@@ -48,7 +67,7 @@ export default function App() {
       const res  = await fetch(`${API}/load-video`, {
         method : "POST",
         headers: { "Content-Type": "application/json" },
-        body   : JSON.stringify({ url: url.trim() }),
+        body   : JSON.stringify({ url: targetUrl.trim() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to load video");
@@ -233,6 +252,23 @@ export default function App() {
               {loading ? <span className="spinner" /> : "Load Video"}
             </button>
           </form>
+          {demos.length > 0 && (
+            <div className="demo-row">
+              <span className="demo-label">Try a demo:</span>
+              {demos.map(d => (
+                <button
+                  key={d.video_id}
+                  type="button"
+                  className="demo-chip"
+                  onClick={() => loadDemo(d.video_id)}
+                  disabled={loading}
+                  title={d.title}
+                >
+                  ▶ {d.title.length > 48 ? d.title.slice(0, 48) + "…" : d.title}
+                </button>
+              ))}
+            </div>
+          )}
           {error && <div className="error-bar">{error}</div>}
         </section>
 

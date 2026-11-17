@@ -22,7 +22,10 @@ from dotenv import load_dotenv
 import chromadb
 from google import genai
 from google.genai import types
+import json
+from pathlib import Path
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
 
 # ── Load environment variables ──────────────────────────────────────────────
 load_dotenv()
@@ -115,6 +118,88 @@ def fmt_time(seconds: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+
+# ── Transcript fetching ─────────────────────────────────────────────────────
+# YouTube blocks most cloud-server IPs (Render, AWS, GCP), so we try, in order:
+#   1. a cached transcript in backend/transcripts/<video_id>.json (demo videos)
+#   2. youtube-transcript-api, through a proxy if one is configured
+#   3. the Supadata transcript API, if SUPADATA_API_KEY is set
+TRANSCRIPT_DIR = Path(__file__).parent / "transcripts"
+LANGS = ["en", "en-IN", "en-US", "en-GB", "hi"]
+
+
+def _yt_client() -> YouTubeTranscriptApi:
+    ws_user, ws_pass = os.getenv("WEBSHARE_PROXY_USERNAME"), os.getenv("WEBSHARE_PROXY_PASSWORD")
+    proxy_url = os.getenv("PROXY_URL")
+    if ws_user and ws_pass:
+        return YouTubeTranscriptApi(proxy_config=WebshareProxyConfig(proxy_username=ws_user, proxy_password=ws_pass))
+    if proxy_url:
+        return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=proxy_url, https_url=proxy_url))
+    return YouTubeTranscriptApi()
+
+
+def _from_supadata(video_id: str) -> list:
+    key = os.getenv("SUPADATA_API_KEY")
+    if not key:
+        return []
+    r = requests.get(
+        "https://api.supadata.ai/v1/youtube/transcript",
+        params={"videoId": video_id},
+        headers={"x-api-key": key},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        return []
+    content = r.json().get("content") or []
+    if not isinstance(content, list):
+        return []
+    return [
+        {"text": c.get("text", ""), "start": c.get("offset", 0) / 1000.0, "duration": c.get("duration", 0) / 1000.0}
+        for c in content
+    ]
+
+
+def fetch_transcript(video_id: str) -> list:
+    cached = TRANSCRIPT_DIR / f"{video_id}.json"
+    if cached.exists():
+        return json.loads(cached.read_text(encoding="utf-8"))["segments"]
+
+    yt_error = None
+    try:
+        return _yt_client().fetch(video_id, languages=LANGS).to_raw_data()
+    except NoTranscriptFound:
+        yt_error = "No English or Hindi captions found for this video."
+    except TranscriptsDisabled:
+        yt_error = "Captions are disabled for this video."
+    except Exception as e:  # RequestBlocked / IpBlocked / network errors
+        yt_error = f"YouTube blocked the request from this server ({type(e).__name__})."
+
+    try:
+        segs = _from_supadata(video_id)
+        if segs:
+            return segs
+    except Exception:
+        pass
+
+    raise HTTPException(
+        status_code=503,
+        detail=f"{yt_error} Try one of the demo videos below, or run the app locally for any video.",
+    )
+
+
+@app.get("/demos")
+async def list_demos():
+    """Demo videos whose transcripts are cached on the server (always work)."""
+    demos = []
+    if TRANSCRIPT_DIR.exists():
+        for f in sorted(TRANSCRIPT_DIR.glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                demos.append({"video_id": f.stem, "title": data.get("title", f.stem)})
+            except Exception:
+                continue
+    return {"demos": demos}
+
 # ── POST /load-video ─────────────────────────────────────────────────────────
 @app.post("/load-video")
 async def load_video(req: LoadVideoRequest):
@@ -132,23 +217,8 @@ async def load_video(req: LoadVideoRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Step 2: fetch transcript (English preferred, Hindi fallback)
-    try:
-        transcript = YouTubeTranscriptApi.get_transcript(
-            video_id, languages=["en", "en-IN", "hi"]
-        )
-    except NoTranscriptFound:
-        raise HTTPException(
-            status_code=404,
-            detail="No transcript found. Try a YouTube video that has captions enabled."
-        )
-    except TranscriptsDisabled:
-        raise HTTPException(
-            status_code=403,
-            detail="Captions are disabled for this video."
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcript fetch error: {str(e)}")
+    # Step 2: fetch transcript (cache → YouTube → Supadata fallback)
+    transcript = fetch_transcript(video_id)
 
     # Step 3: chunk
     chunks = chunk_transcript(transcript, chunk_size=300, overlap=50)
